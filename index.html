@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Curling Push</title>
+<link href="https://fonts.googleapis.com/css2?family=Special+Elite&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; overflow:hidden; background:#000; }
+  body {
+    font-family:'Special Elite', monospace;
+    color:#9a9f9f;
+    touch-action:none; user-select:none; -webkit-user-select:none;
+  }
+  #wrap {
+    position:fixed; inset:0; display:flex; flex-direction:column;
+    padding-top:max(env(safe-area-inset-top, 0px), 52px);
+    padding-bottom:env(safe-area-inset-bottom);
+  }
+  #field { flex:1; position:relative; margin:8px; border:2px solid rgba(255,255,255,0.7); border-radius:6px; overflow:hidden; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  #info {
+    height:54px; display:flex; align-items:center; justify-content:space-between;
+    padding:0 16px; font-size:15px; letter-spacing:0.1em;
+  }
+  #log { color:#46ff7d; }
+  #best { color:#9a9f9f; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="field"><canvas id="game"></canvas></div>
+  <div id="info">
+    <div id="log">퍽을 손으로 밀어 보세요</div>
+    <div id="best">BEST 0</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const canvas=document.getElementById('game');
+  const ctx=canvas.getContext('2d');
+  const fieldEl=document.getElementById('field');
+  const logEl=document.getElementById('log');
+  const bestEl=document.getElementById('best');
+
+  let W=0,H=0,DPR=1;
+  function resize(){
+    DPR=Math.min(window.devicePixelRatio||1,2);
+    const r=fieldEl.getBoundingClientRect();
+    W=r.width; H=r.height;
+    canvas.width=W*DPR; canvas.height=H*DPR;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    layout();
+  }
+  window.addEventListener('resize',resize);
+
+  // ── 빙판 레이아웃 ──
+  // 하우스(과녁)는 위쪽, 출발 지점은 아래쪽. 화면 전체가 밀 수 있는 공간.
+  let house={x:0,y:0,r1:0,r2:0,r3:0};   // 바깥/중간/안쪽 원
+  let backLine=0;                        // 이 선을 넘어가면 OVER (아웃)
+  let startY=0;
+  function layout(){
+    house.x=W/2;
+    house.y=H*0.18;
+    house.r3=Math.min(W,H)*0.06;   // 버튼(중심)
+    house.r2=house.r3*2.4;
+    house.r1=house.r3*4.0;
+    backLine=H*0.045;
+    startY=H*0.88;
+  }
+
+  // ── 퍽 ──
+  const PUCK_R_RATIO=0.055;
+  let puck=null;
+  let stones=[];     // 멈춘 퍽들 (빙판에 남음)
+  let throwsCount=0;
+  let best=0;
+
+  function newPuck(){
+    puck={
+      x:W/2, y:startY,
+      vx:0, vy:0,
+      r:Math.min(W,H)*PUCK_R_RATIO,
+      color:'#2ee6e6',
+      held:false,
+      thrown:false,
+      pid:null
+    };
+  }
+
+  // ── 사운드 ──
+  let audioCtx=null;
+  function sound(freq,dur,vol,type){
+    try{
+      if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+      const o=audioCtx.createOscillator(),g=audioCtx.createGain();
+      o.type=type||'sine';
+      o.frequency.setValueAtTime(freq,audioCtx.currentTime);
+      o.frequency.exponentialRampToValueAtTime(Math.max(50,freq*0.5),audioCtx.currentTime+dur);
+      g.gain.setValueAtTime(vol,audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001,audioCtx.currentTime+dur);
+      o.connect(g);g.connect(audioCtx.destination);
+      o.start();o.stop(audioCtx.currentTime+dur+0.02);
+    }catch(e){}
+  }
+
+  // ── 손으로 밀기: 포인터 추적 ──
+  // 최근 손 위치들을 기록해서 놓는 순간의 속도를 계산
+  let samples=[];
+  function fieldPos(e){
+    const r=fieldEl.getBoundingClientRect();
+    return {x:e.clientX-r.left, y:e.clientY-r.top, t:performance.now()};
+  }
+
+  fieldEl.addEventListener('pointerdown', e=>{
+    if(!puck || puck.thrown) return;
+    const p=fieldPos(e);
+    const d=Math.hypot(p.x-puck.x, p.y-puck.y);
+    if(d < puck.r*2.6){           // 손바닥 터치를 위해 넉넉한 잡기 판정
+      puck.held=true;
+      puck.pid=e.pointerId;
+      samples=[p];
+      sound(180,0.06,0.08);
+    }
+  });
+
+  fieldEl.addEventListener('pointermove', e=>{
+    if(!puck || !puck.held || e.pointerId!==puck.pid) return;
+    const p=fieldPos(e);
+    // 퍽이 손을 따라옴
+    puck.x=p.x; puck.y=p.y;
+    samples.push(p);
+    if(samples.length>6) samples.shift();
+  });
+
+  function release(e){
+    if(!puck || !puck.held || (e && e.pointerId!==puck.pid)) return;
+    puck.held=false;
+    // 놓는 순간의 손 속도 = 퍽 속도 (최근 표본으로 계산)
+    if(samples.length>=2){
+      const a=samples[0], b=samples[samples.length-1];
+      const dt=Math.max(8, b.t-a.t);   // ms
+      const k=16.7/dt;                  // 프레임(60fps) 단위 속도로 변환
+      puck.vx=(b.x-a.x)*k;
+      puck.vy=(b.y-a.y)*k;
+    }
+    const sp=Math.hypot(puck.vx,puck.vy);
+    if(sp>0.8){
+      puck.thrown=true;
+      throwsCount++;
+      logEl.textContent='던지기 #'+throwsCount+'  속도 '+sp.toFixed(1);
+      sound(240+Math.min(sp,40)*8, 0.15, 0.18);
+    }else{
+      // 거의 안 움직였으면 제자리 (놓침 방지)
+      puck.vx=0; puck.vy=0;
+    }
+    samples=[];
+  }
+  window.addEventListener('pointerup', release);
+  window.addEventListener('pointercancel', release);
+
+  // ── 물리 (Just Pop It의 빙판 버전: 마찰을 더 약하게) ──
+  function scoreOf(x,y){
+    const d=Math.hypot(x-house.x, y-house.y);
+    if(d<=house.r3) return 5;
+    if(d<=house.r2) return 3;
+    if(d<=house.r1) return 1;
+    return 0;
+  }
+
+  function step(){
+    if(!puck) return;
+    if(puck.thrown){
+      puck.x+=puck.vx; puck.y+=puck.vy;
+      // 얼음 마찰: 아주 천천히 죽음
+      const sp=Math.hypot(puck.vx,puck.vy);
+      if(sp>0){
+        const ns=Math.max(0, sp*0.994-0.012);
+        if(ns<0.05){ puck.vx=0; puck.vy=0; stopPuck(); }
+        else { puck.vx=puck.vx/sp*ns; puck.vy=puck.vy/sp*ns; }
+      }
+      // 좌우 벽: 살짝 반사
+      if(puck.x<puck.r){ puck.x=puck.r; puck.vx=Math.abs(puck.vx)*0.7; sound(300,0.05,0.05); }
+      if(puck.x>W-puck.r){ puck.x=W-puck.r; puck.vx=-Math.abs(puck.vx)*0.7; sound(300,0.05,0.05); }
+      // 뒤로 빠지면 그냥 정지
+      if(puck.y>H-puck.r){ puck.y=H-puck.r; puck.vy=0; }
+      // 백라인을 넘으면 OVER
+      if(puck.thrown && puck.y+puck.r < backLine+2){
+        over();
+        return;
+      }
+      // 멈춘 퍽들과 충돌 (Just Pop It 운동량 전달 그대로)
+      for(const s of stones){
+        const dx=s.x-puck.x, dy=s.y-puck.y;
+        const dist=Math.hypot(dx,dy), minD=s.r+puck.r;
+        if(dist<minD && dist>0.0001){
+          const nx=dx/dist, ny=dy/dist;
+          const overlap=(minD-dist)/2;
+          puck.x-=nx*overlap; puck.y-=ny*overlap;
+          s.x+=nx*overlap; s.y+=ny*overlap;
+          const rel=(s.vx-puck.vx)*nx+(s.vy-puck.vy)*ny;
+          if(rel<0){
+            const jval=rel*0.95;
+            puck.vx+=jval*nx; puck.vy+=jval*ny;
+            s.vx-=jval*nx; s.vy-=jval*ny;
+            sound(420,0.08,0.12,'triangle');
+          }
+        }
+      }
+    }
+    // 멈춘 퍽들도 밀리면 움직임
+    for(const s of stones){
+      if(s.vx||s.vy){
+        s.x+=s.vx; s.y+=s.vy;
+        const sp=Math.hypot(s.vx,s.vy);
+        const ns=Math.max(0, sp*0.994-0.012);
+        if(ns<0.05){ s.vx=0; s.vy=0; }
+        else { s.vx=s.vx/sp*ns; s.vy=s.vy/sp*ns; }
+        if(s.x<s.r){ s.x=s.r; s.vx=Math.abs(s.vx)*0.7; }
+        if(s.x>W-s.r){ s.x=W-s.r; s.vx=-Math.abs(s.vx)*0.7; }
+        if(s.y+s.r<backLine+2){ s.dead=true; } // 밀려서 백라인 넘으면 제거
+        if(s.y>H-s.r){ s.y=H-s.r; s.vy=0; }
+      }
+    }
+    stones=stones.filter(s=>!s.dead);
+  }
+
+  function stopPuck(){
+    const sc=scoreOf(puck.x,puck.y);
+    if(sc>best){ best=sc; bestEl.textContent='BEST '+best; }
+    logEl.textContent = sc>0 ? ('정지!  '+sc+'점 존') : '정지 (하우스 밖)';
+    sound(sc>0? 600: 200, 0.2, 0.15);
+    stones.push({x:puck.x,y:puck.y,vx:0,vy:0,r:puck.r,color:puck.color});
+    if(stones.length>8) stones.shift();   // 너무 많아지면 오래된 것부터 제거
+    newPuck();
+  }
+
+  function over(){
+    logEl.textContent='OVER!  너무 셉니다';
+    sound(140,0.3,0.15,'sawtooth');
+    newPuck();
+  }
+
+  // ── 그리기 ──
+  function draw(){
+    ctx.fillStyle='#050505';
+    ctx.fillRect(0,0,W,H);
+    // 모눈 (빙판 결)
+    ctx.strokeStyle='rgba(255,255,255,0.05)';
+    ctx.lineWidth=1;
+    ctx.beginPath();
+    for(let x=0;x<=W;x+=18){ctx.moveTo(x,0);ctx.lineTo(x,H);}
+    for(let y=0;y<=H;y+=18){ctx.moveTo(0,y);ctx.lineTo(W,y);}
+    ctx.stroke();
+
+    // 하우스 (과녁 원 3개)
+    ctx.save();
+    ctx.lineWidth=2.5;
+    ctx.shadowBlur=10;
+    ctx.shadowColor='#ff4040';
+    ctx.strokeStyle='rgba(255,64,64,0.85)';
+    ctx.beginPath(); ctx.arc(house.x,house.y,house.r1,0,Math.PI*2); ctx.stroke();
+    ctx.shadowColor='#e8eaea';
+    ctx.strokeStyle='rgba(232,234,234,0.85)';
+    ctx.beginPath(); ctx.arc(house.x,house.y,house.r2,0,Math.PI*2); ctx.stroke();
+    ctx.shadowColor='#5a9bff';
+    ctx.strokeStyle='rgba(90,155,255,0.95)';
+    ctx.beginPath(); ctx.arc(house.x,house.y,house.r3,0,Math.PI*2); ctx.stroke();
+    ctx.restore();
+
+    // 백라인
+    ctx.save();
+    ctx.strokeStyle='rgba(255,64,64,0.6)';
+    ctx.setLineDash([8,8]);
+    ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(0,backLine); ctx.lineTo(W,backLine); ctx.stroke();
+    ctx.restore();
+
+    // 점수 표시 (워터마크)
+    ctx.save();
+    ctx.globalAlpha=0.4;
+    ctx.fillStyle='#5e6363';
+    ctx.textAlign='center';
+    ctx.font=Math.min(W*0.045,18)+'px "Special Elite", monospace';
+    ctx.fillText('5', house.x, house.y+5);
+    ctx.fillText('3', house.x+(house.r3+house.r2)/2, house.y+5);
+    ctx.fillText('1', house.x+(house.r2+house.r1)/2, house.y+5);
+    ctx.restore();
+
+    // 멈춘 퍽들
+    for(const s of stones) drawStone(s, 0.75);
+    // 현재 퍽
+    if(puck) drawStone(puck, 1, puck.held);
+
+    requestAnimationFrame(()=>{step();draw();});
+  }
+
+  function drawStone(s, alpha, held){
+    ctx.save();
+    ctx.globalAlpha=alpha;
+    ctx.shadowColor=s.color;
+    ctx.shadowBlur=held?20:12;
+    ctx.beginPath();
+    ctx.arc(s.x,s.y,s.r,0,Math.PI*2);
+    ctx.fillStyle='rgba(0,0,0,0.85)';
+    ctx.fill();
+    ctx.lineWidth=held?4:3;
+    ctx.strokeStyle=s.color;
+    ctx.stroke();
+    // 손잡이 표시 (작은 안쪽 원)
+    ctx.beginPath();
+    ctx.arc(s.x,s.y,s.r*0.35,0,Math.PI*2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  resize();
+  newPuck();
+  draw();
+})();
+</script>
+</body>
+</html>
